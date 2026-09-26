@@ -54,8 +54,15 @@ class RecordQuery:
         return True
 
     def apply(self, records: Iterable[Record]) -> list[Record]:
-        """Return the records that pass the filter, newest last."""
-        return [record for record in records if self.matches(record)]
+        """Return the records that pass the filter, newest last.
+
+        With a limit, keep only the newest matching records; the survivors
+        stay in stream order so the most recent one is the last element.
+        """
+        matched = [record for record in records if self.matches(record)]
+        if self.limit is not None and self.limit >= 0 and len(matched) > self.limit:
+            matched = matched[-self.limit :]
+        return matched
 
     def describe(self) -> dict[str, Any]:
         """Render the active conditions for the wire."""

@@ -6,9 +6,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from line_control.runtime.clock import LogicalClock
-from line_control.runtime.errors import UnknownReferenceError, ValidationError
+from line_control.runtime.errors import (
+    DuplicateRecordError,
+    UnknownReferenceError,
+    ValidationError,
+)
 from line_control.runtime.keys import scope_key
 from line_control.store.stream import RecordStream
+
+OPEN_KIND = "batch.open"
+CLOSE_KIND = "batch.close"
 
 
 @dataclass(frozen=True)
@@ -54,41 +61,80 @@ class BatchRegistry:
         return scope_key("batch", batch_id)
 
     def open(self, batch_id: str, unit: str, subject: str = "", generation: int = 0) -> Batch:
-        """Start a batch."""
+        """Claim a batch identifier; the same identifier can never be claimed twice."""
         if not batch_id or not unit:
             raise ValidationError("batch identifier and unit are required")
+        if self.read(batch_id) is not None:
+            raise DuplicateRecordError(
+                f"batch {batch_id} was already opened", batch_id=batch_id
+            )
         tick = self._clock.tick()
+        record = self._stream.append(
+            OPEN_KIND,
+            self.key(batch_id),
+            {
+                "batch_id": batch_id,
+                "unit": unit,
+                "subject": subject,
+                "opened_tick": tick,
+            },
+            generation=int(generation),
+        )
+        self._stream.commit_upto(record.seq)
         return Batch(batch_id, unit, subject, tick, generation=int(generation))
 
     def resolve(self, batch_id: str, decision: str) -> Batch:
-        """Store the decision taken for a batch."""
+        """Store the decision taken for a batch, exactly once."""
         if not decision:
             raise ValidationError("a decision is required", batch_id=batch_id)
+        batch = self.require(batch_id)
+        if not batch.is_open:
+            raise DuplicateRecordError(
+                f"batch {batch_id} already carries a decision",
+                batch_id=batch_id,
+                decision=batch.decision,
+            )
         tick = self._clock.tick()
         record = self._stream.append(
-            "batch.close",
+            CLOSE_KIND,
             self.key(batch_id),
-            {"batch_id": batch_id, "closed_tick": tick, "decision": decision},
+            {
+                "batch_id": batch_id,
+                "unit": batch.unit,
+                "subject": batch.subject,
+                "opened_tick": batch.opened_tick,
+                "closed_tick": tick,
+                "decision": decision,
+            },
+            generation=batch.generation,
         )
         self._stream.commit_upto(record.seq)
         return Batch(
-            batch_id, "", "", tick, closed_tick=tick, decision=decision
+            batch_id,
+            batch.unit,
+            batch.subject,
+            batch.opened_tick,
+            closed_tick=tick,
+            decision=decision,
+            generation=batch.generation,
         )
 
     def read(self, batch_id: str) -> Batch | None:
-        """Return a batch, or ``None`` when no decision was stored."""
+        """Return a batch, or ``None`` when it was never opened."""
         record = self._stream.visible_view().current(self.key(batch_id))
         if record is None:
             return None
         payload = record.payload
+        opened_tick = payload.get("opened_tick", record.tick)
+        closed_tick = payload.get("closed_tick")
         return Batch(
             batch_id=batch_id,
             unit=str(payload.get("unit", "")),
             subject=str(payload.get("subject", "")),
-            opened_tick=int(payload.get("closed_tick", 0)),
-            closed_tick=payload.get("closed_tick"),
+            opened_tick=int(opened_tick),
+            closed_tick=None if closed_tick is None else int(closed_tick),
             decision=str(payload.get("decision", "")),
-            generation=int(payload.get("generation", 0)),
+            generation=int(payload.get("generation", record.generation)),
         )
 
     def require(self, batch_id: str) -> Batch:
@@ -102,8 +148,21 @@ class BatchRegistry:
 
     def open_batches(self, unit: str | None = None) -> list[Batch]:
         """Return the batches that are still open, optionally for one unit."""
-        return []
+        view = self._stream.visible_view()
+        batches: list[Batch] = []
+        for record in self._stream.visible(OPEN_KIND):
+            # A close record supersedes the open one on the same key; the
+            # batch is still open exactly while its open record still decides.
+            if view.current(record.key) is not record:
+                continue
+            batch = self.read(record.payload.get("batch_id", ""))
+            if batch is None:
+                continue
+            if unit is not None and batch.unit != unit:
+                continue
+            batches.append(batch)
+        return sorted(batches, key=lambda batch: batch.opened_tick)
 
     def count(self) -> int:
-        """Return how many decisions have been stored."""
-        return len(self._stream.visible("batch.close"))
+        """Return how many batches have been opened."""
+        return len(self._stream.visible(OPEN_KIND))
