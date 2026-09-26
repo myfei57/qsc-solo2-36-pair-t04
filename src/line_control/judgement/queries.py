@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
+from line_control.runtime.errors import ValidationError
 from line_control.store.records import Record
 
 
@@ -33,6 +34,11 @@ class RecordQuery:
     include_tombstones: bool = False
     limit: int | None = None
 
+    def __post_init__(self) -> None:
+        """Refuse a limit that could never select a record."""
+        if self.limit is not None and self.limit <= 0:
+            raise ValidationError("query limit must be positive", limit=self.limit)
+
     def matches(self, record: Record) -> bool:
         """Report whether one record passes every active condition."""
         if self.unit is not None and record_unit(record) != self.unit:
@@ -54,8 +60,16 @@ class RecordQuery:
         return True
 
     def apply(self, records: Iterable[Record]) -> list[Record]:
-        """Return the records that pass the filter, newest last."""
-        return [record for record in records if self.matches(record)]
+        """Return the records that pass the filter, newest last.
+
+        Records come out in stream order (oldest first, newest last); when a
+        limit is set, the newest ``limit`` matching records are kept while that
+        order is preserved.
+        """
+        selected = [record for record in records if self.matches(record)]
+        if self.limit is not None:
+            selected = selected[-self.limit :]
+        return selected
 
     def describe(self) -> dict[str, Any]:
         """Render the active conditions for the wire."""
